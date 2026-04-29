@@ -1,41 +1,26 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 mod backend;
+mod cli;
 mod core;
 mod ui;
 mod windows_utils;
 
-use std::{
-    thread::{self, JoinHandle},
-    time::Duration,
-};
+use std::thread::{self, JoinHandle};
 
+use clap::Parser;
 use eframe::egui;
 use tokio::{runtime::Runtime, sync::mpsc};
 
-use crate::{core::SystemStats, windows_utils::monitor::start_system_monitor};
+use crate::{
+    backend::backend_loop,
+    cli::{Cli, CliCommand},
+    core::{AppCommand, AppEvent, AppTask, SystemStats},
+    windows_utils::monitor::start_system_monitor,
+};
 
 type CommandSender = mpsc::UnboundedSender<AppCommand>;
 type CommandReceiver = mpsc::UnboundedReceiver<AppCommand>;
 type EventSender = mpsc::UnboundedSender<AppEvent>;
 type EventReceiver = mpsc::UnboundedReceiver<AppEvent>;
-
-#[derive(Debug, Clone)]
-pub enum AppCommand {
-    TestBackend,
-    Shutdown,
-}
-
-#[derive(Debug, Clone)]
-pub enum AppEvent {
-    BackendReady,
-    StatusChanged(String),
-    ProgressChanged(f32),
-    TaskFinished(String),
-    ResourceUpdate(SystemStats),
-    BackendStopped,
-    Error(String),
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppTab {
@@ -57,6 +42,12 @@ impl AppTab {
 }
 
 fn main() -> eframe::Result {
+    let cli = Cli::parse();
+
+    if matches!(cli.command, Some(CliCommand::Automation { .. })) {
+        run_headless_mode();
+    }
+
     let (tx_cmd, rx_cmd) = mpsc::unbounded_channel::<AppCommand>();
     let (tx_event, rx_event) = mpsc::unbounded_channel::<AppEvent>();
     let backend_thread = start_backend_thread(rx_cmd, tx_event);
@@ -83,6 +74,14 @@ fn main() -> eframe::Result {
     )
 }
 
+fn run_headless_mode() -> ! {
+    let runtime = Runtime::new().expect("failed to start Tokio runtime");
+    runtime.block_on(async {
+        println!("Запуск в headless режиме");
+    });
+    std::process::exit(0);
+}
+
 fn start_backend_thread(rx_cmd: CommandReceiver, tx_event: EventSender) -> JoinHandle<()> {
     thread::Builder::new()
         .name("tech-toolkit-tokio-backend".to_owned())
@@ -97,37 +96,6 @@ fn start_backend_thread(rx_cmd: CommandReceiver, tx_event: EventSender) -> JoinH
         .expect("failed to spawn backend thread")
 }
 
-async fn backend_loop(mut rx_cmd: CommandReceiver, tx_event: EventSender) {
-    while let Some(command) = rx_cmd.recv().await {
-        match command {
-            AppCommand::TestBackend => run_backend_test(&tx_event).await,
-            AppCommand::Shutdown => {
-                let _ = tx_event.send(AppEvent::BackendStopped);
-                break;
-            }
-        }
-    }
-}
-
-async fn run_backend_test(tx_event: &EventSender) {
-    let _ = tx_event.send(AppEvent::StatusChanged(
-        "Backend: тестовая задача запущена".to_owned(),
-    ));
-
-    for step in 0..=10 {
-        let progress = step as f32 / 10.0;
-        let _ = tx_event.send(AppEvent::ProgressChanged(progress));
-        let _ = tx_event.send(AppEvent::StatusChanged(format!(
-            "Backend: обработка {step}/10"
-        )));
-        tokio::time::sleep(Duration::from_millis(180)).await;
-    }
-
-    let _ = tx_event.send(AppEvent::TaskFinished(
-        "Backend: тестовая задача завершена".to_owned(),
-    ));
-}
-
 pub struct RustMhApp {
     tx_cmd: CommandSender,
     rx_event: EventReceiver,
@@ -135,6 +103,11 @@ pub struct RustMhApp {
     status_text: String,
     progress: f32,
     backend_busy: bool,
+    task_name: String,
+    task_status_text: String,
+    task_progress: f32,
+    displayed_task_progress: f32,
+    task_active: bool,
     current_stats: Option<SystemStats>,
     current_tab: AppTab,
     log_lines: Vec<String>,
@@ -156,6 +129,11 @@ impl RustMhApp {
             status_text: "UI готов. Ожидание backend...".to_owned(),
             progress: 0.0,
             backend_busy: false,
+            task_name: "Нет активных задач".to_owned(),
+            task_status_text: "Очередь задач пуста".to_owned(),
+            task_progress: 0.0,
+            displayed_task_progress: 0.0,
+            task_active: false,
             current_stats: None,
             current_tab: AppTab::Dashboard,
             log_lines: Vec::new(),
@@ -181,9 +159,25 @@ impl RustMhApp {
             AppEvent::ProgressChanged(progress) => {
                 self.progress = progress.clamp(0.0, 1.0);
             }
+            AppEvent::TaskProgress {
+                task_name,
+                progress,
+                status_text,
+            } => {
+                self.task_name = task_name;
+                self.task_progress = progress.clamp(0.0, 1.0);
+                self.task_status_text = status_text.clone();
+                self.status_text = status_text;
+                self.task_active = self.task_progress < 1.0;
+            }
             AppEvent::TaskFinished(message) => {
                 self.backend_busy = false;
                 self.progress = 1.0;
+                if self.task_active || self.task_progress > 0.0 {
+                    self.task_active = false;
+                    self.task_progress = 1.0;
+                    self.task_status_text = message.clone();
+                }
                 self.status_text = message.clone();
                 self.log_lines.push(message);
             }
@@ -196,7 +190,9 @@ impl RustMhApp {
             }
             AppEvent::Error(message) => {
                 self.backend_busy = false;
+                self.task_active = false;
                 self.status_text = format!("Ошибка: {message}");
+                self.task_status_text = self.status_text.clone();
                 self.log_lines.push(self.status_text.clone());
             }
         }
@@ -220,7 +216,7 @@ impl RustMhApp {
                 if let Some(stats) = &self.current_stats {
                     let ram_ratio = ratio(stats.ram_used, stats.ram_total);
 
-                    ui.label(format!("🖥 CPU: {:.0}%", stats.cpu_usage));
+                    ui.label(format!("CPU: {:.0}%", stats.cpu_usage));
                     ui.add(
                         egui::ProgressBar::new(stats.cpu_usage / 100.0)
                             .desired_width(110.0)
@@ -228,7 +224,7 @@ impl RustMhApp {
                     );
                     ui.separator();
                     ui.label(format!(
-                        "🧠 RAM: {:.1}/{:.1} GB",
+                        "RAM: {:.1}/{:.1} GB",
                         bytes_to_gb(stats.ram_used),
                         bytes_to_gb(stats.ram_total)
                     ));
@@ -239,11 +235,11 @@ impl RustMhApp {
                     );
                     ui.separator();
                     ui.label(format!(
-                        "💾 Disk: R {} / W {} KB/s",
+                        "Disk: R {} / W {} KB/s",
                         stats.disk_read_kb, stats.disk_write_kb
                     ));
                 } else {
-                    ui.label("🖥 CPU: -- | 🧠 RAM: --/-- GB | 💾 Disk: R -- / W -- KB/s");
+                    ui.label("CPU: -- | RAM: --/-- GB | Disk: R -- / W -- KB/s");
                     ui.add(egui::ProgressBar::new(0.0).desired_width(110.0));
                     ui.add(egui::ProgressBar::new(0.0).desired_width(130.0));
                 }
@@ -280,7 +276,7 @@ impl RustMhApp {
     fn show_central_panel(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show_inside(ui, |ui| match self.current_tab {
             AppTab::Dashboard => self.show_dashboard(ui),
-            AppTab::IikoInstall => self.show_placeholder(ui, AppTab::IikoInstall.title()),
+            AppTab::IikoInstall => self.show_iiko_install(ui),
             AppTab::FiscalDrivers => self.show_placeholder(ui, AppTab::FiscalDrivers.title()),
             AppTab::Logs => self.show_logs(ui),
         });
@@ -311,6 +307,47 @@ impl RustMhApp {
         );
     }
 
+    fn show_iiko_install(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Установка iiko");
+        ui.add_space(12.0);
+
+        ui.horizontal(|ui| {
+            let download_button =
+                egui::Button::new("Тестовая загрузка").min_size(egui::vec2(190.0, 48.0));
+
+            if ui.add_enabled(!self.task_active, download_button).clicked() {
+                let dest = std::env::temp_dir().join("rustmh-test-download-10mb.bin");
+
+                self.task_name = "Скачивание rustmh-test-download-10mb.bin".to_owned();
+                self.task_status_text = format!("Ожидание backend: {}", dest.display());
+                self.task_progress = 0.0;
+                self.displayed_task_progress = 0.0;
+                self.task_active = true;
+
+                self.send_command(AppCommand::EnqueueTask(AppTask::DownloadFile {
+                    url: "https://speed.hetzner.de/10MB.bin".to_owned(),
+                    dest: dest.to_string_lossy().into_owned(),
+                }));
+            }
+
+            ui.label(&self.task_status_text);
+        });
+
+        ui.add_space(12.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(&self.task_name);
+            ui.add_space(6.0);
+            ui.add(
+                egui::ProgressBar::new(self.displayed_task_progress)
+                    .desired_width(f32::INFINITY)
+                    .show_percentage()
+                    .text(format!("{:.0}%", self.displayed_task_progress * 100.0)),
+            );
+            ui.add_space(4.0);
+            ui.label(&self.task_status_text);
+        });
+    }
+
     fn show_placeholder(&self, ui: &mut egui::Ui, title: &str) {
         ui.heading(title);
         ui.add_space(12.0);
@@ -334,6 +371,14 @@ impl RustMhApp {
 impl eframe::App for RustMhApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_backend_events();
+
+        let delta = self.task_progress - self.displayed_task_progress;
+        if delta.abs() > 0.001 {
+            self.displayed_task_progress += delta * 0.18;
+        } else {
+            self.displayed_task_progress = self.task_progress;
+        }
+
         ctx.request_repaint();
     }
 

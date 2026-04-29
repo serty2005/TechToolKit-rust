@@ -3,7 +3,7 @@ use std::time::Duration;
 use sysinfo::{Disks, Networks, System};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{AppEvent, core::SystemStats};
+use crate::core::{AppEvent, SystemStats};
 
 pub async fn start_system_monitor(tx: UnboundedSender<AppEvent>) {
     let mut sys = System::new();
