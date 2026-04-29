@@ -18,6 +18,7 @@ use crate::{
     backend::backend_loop,
     cli::{Cli, CliCommand},
     core::{AppCommand, AppEvent, AppTask, IikoComponent, SystemStats},
+    ui::tiles::{Pane, TreeBehavior},
     windows_utils::monitor::start_system_monitor,
 };
 
@@ -25,25 +26,6 @@ type CommandSender = mpsc::UnboundedSender<AppCommand>;
 type CommandReceiver = mpsc::UnboundedReceiver<AppCommand>;
 type EventSender = mpsc::UnboundedSender<AppEvent>;
 type EventReceiver = mpsc::UnboundedReceiver<AppEvent>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppTab {
-    Dashboard,
-    IikoInstall,
-    FiscalDrivers,
-    Logs,
-}
-
-impl AppTab {
-    fn title(self) -> &'static str {
-        match self {
-            Self::Dashboard => "Главная (Dashboard)",
-            Self::IikoInstall => "Установка iiko",
-            Self::FiscalDrivers => "ККТ и Драйверы",
-            Self::Logs => "Логи",
-        }
-    }
-}
 
 fn main() -> eframe::Result {
     let cli = Cli::parse();
@@ -104,6 +86,7 @@ pub struct RustMhApp {
     tx_cmd: CommandSender,
     rx_event: EventReceiver,
     backend_thread: Option<JoinHandle<()>>,
+    tree: egui_tiles::Tree<Pane>,
     status_text: String,
     progress: f32,
     backend_busy: bool,
@@ -113,7 +96,6 @@ pub struct RustMhApp {
     displayed_task_progress: f32,
     task_active: bool,
     current_stats: Option<SystemStats>,
-    current_tab: AppTab,
     log_lines: Vec<String>,
     iiko_component: IikoComponent,
     iiko_versions: Vec<String>,
@@ -137,6 +119,7 @@ impl RustMhApp {
             tx_cmd,
             rx_event,
             backend_thread: Some(backend_thread),
+            tree: ui::tiles::default_tree(),
             status_text: "UI готов. Ожидание backend...".to_owned(),
             progress: 0.0,
             backend_busy: false,
@@ -146,7 +129,6 @@ impl RustMhApp {
             displayed_task_progress: 0.0,
             task_active: false,
             current_stats: None,
-            current_tab: AppTab::Dashboard,
             log_lines: Vec::new(),
             iiko_component: IikoComponent::Front,
             iiko_versions: Vec::new(),
@@ -243,82 +225,44 @@ impl RustMhApp {
         }
     }
 
-    fn show_status_panel(&self, ui: &mut egui::Ui) {
-        egui::Panel::top("status_panel").show_inside(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if let Some(stats) = &self.current_stats {
-                    let ram_ratio = ratio(stats.ram_used, stats.ram_total);
-
-                    ui.label(format!("CPU: {:.0}%", stats.cpu_usage));
-                    ui.add(
-                        egui::ProgressBar::new(stats.cpu_usage / 100.0)
-                            .desired_width(110.0)
-                            .show_percentage(),
-                    );
-                    ui.separator();
-                    ui.label(format!(
-                        "RAM: {:.1}/{:.1} GB",
-                        bytes_to_gb(stats.ram_used),
-                        bytes_to_gb(stats.ram_total)
-                    ));
-                    ui.add(
-                        egui::ProgressBar::new(ram_ratio)
-                            .desired_width(130.0)
-                            .show_percentage(),
-                    );
-                    ui.separator();
-                    ui.label(format!(
-                        "Disk: R {} / W {} KB/s",
-                        stats.disk_read_kb, stats.disk_write_kb
-                    ));
-                } else {
-                    ui.label("CPU: -- | RAM: --/-- GB | Disk: R -- / W -- KB/s");
-                    ui.add(egui::ProgressBar::new(0.0).desired_width(110.0));
-                    ui.add(egui::ProgressBar::new(0.0).desired_width(130.0));
-                }
-            });
-        });
-    }
-
-    fn show_navigation(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::left("navigation_panel")
-            .resizable(false)
-            .default_size(220.0)
-            .show_inside(ui, |ui| {
-                ui.heading("TechToolKit");
-                ui.separator();
-                ui.selectable_value(
-                    &mut self.current_tab,
-                    AppTab::Dashboard,
-                    AppTab::Dashboard.title(),
-                );
-                ui.selectable_value(
-                    &mut self.current_tab,
-                    AppTab::IikoInstall,
-                    AppTab::IikoInstall.title(),
-                );
-                ui.selectable_value(
-                    &mut self.current_tab,
-                    AppTab::FiscalDrivers,
-                    AppTab::FiscalDrivers.title(),
-                );
-                ui.selectable_value(&mut self.current_tab, AppTab::Logs, AppTab::Logs.title());
-            });
-    }
-
-    fn show_central_panel(&mut self, ui: &mut egui::Ui) {
-        egui::CentralPanel::default().show_inside(ui, |ui| match self.current_tab {
-            AppTab::Dashboard => self.show_dashboard(ui),
-            AppTab::IikoInstall => self.show_iiko_install(ui),
-            AppTab::FiscalDrivers => self.show_placeholder(ui, AppTab::FiscalDrivers.title()),
-            AppTab::Logs => self.show_logs(ui),
-        });
-    }
-
-    fn show_dashboard(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Главная");
+    pub(crate) fn show_system_monitor(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Мониторинг системы");
         ui.add_space(12.0);
 
+        if let Some(stats) = &self.current_stats {
+            let ram_ratio = ratio(stats.ram_used, stats.ram_total);
+
+            ui.label(format!("CPU: {:.0}%", stats.cpu_usage));
+            ui.add(
+                egui::ProgressBar::new(stats.cpu_usage / 100.0)
+                    .desired_width(f32::INFINITY)
+                    .show_percentage(),
+            );
+
+            ui.add_space(8.0);
+            ui.label(format!(
+                "RAM: {:.1}/{:.1} GB",
+                bytes_to_gb(stats.ram_used),
+                bytes_to_gb(stats.ram_total)
+            ));
+            ui.add(
+                egui::ProgressBar::new(ram_ratio)
+                    .desired_width(f32::INFINITY)
+                    .show_percentage(),
+            );
+
+            ui.add_space(8.0);
+            ui.label(format!(
+                "Disk: R {} / W {} KB/s",
+                stats.disk_read_kb, stats.disk_write_kb
+            ));
+        } else {
+            ui.label("CPU: -- | RAM: --/-- GB | Disk: R -- / W -- KB/s");
+            ui.add(egui::ProgressBar::new(0.0).desired_width(f32::INFINITY));
+            ui.add(egui::ProgressBar::new(0.0).desired_width(f32::INFINITY));
+        }
+
+        ui.separator();
         ui.horizontal(|ui| {
             let test_button = egui::Button::new("Тест Backend").min_size(egui::vec2(180.0, 48.0));
 
@@ -340,7 +284,7 @@ impl RustMhApp {
         );
     }
 
-    fn show_iiko_install(&mut self, ui: &mut egui::Ui) {
+    pub(crate) fn show_iiko_install(&mut self, ui: &mut egui::Ui) {
         ui.heading("Установка iiko");
         ui.add_space(12.0);
 
@@ -452,13 +396,13 @@ impl RustMhApp {
             .unwrap_or_else(|| "Введите версию вручную".to_owned())
     }
 
-    fn show_placeholder(&self, ui: &mut egui::Ui, title: &str) {
-        ui.heading(title);
+    pub(crate) fn show_service_control(&self, ui: &mut egui::Ui) {
+        ui.heading("Сервисы и драйверы");
         ui.add_space(12.0);
         ui.label("Раздел в работе.");
     }
 
-    fn show_logs(&self, ui: &mut egui::Ui) {
+    pub(crate) fn show_logs(&self, ui: &mut egui::Ui) {
         ui.heading("Логи");
         ui.add_space(12.0);
         egui::ScrollArea::vertical()
@@ -494,9 +438,13 @@ impl eframe::App for RustMhApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.show_status_panel(ui);
-        self.show_navigation(ui);
-        self.show_central_panel(ui);
+        let mut tree = std::mem::replace(
+            &mut self.tree,
+            egui_tiles::Tree::empty("tech_toolkit_tree_swap"),
+        );
+        let mut behavior = TreeBehavior::new(self);
+        tree.ui(&mut behavior, ui);
+        self.tree = tree;
     }
 }
 
