@@ -13,6 +13,8 @@ use std::{
 use eframe::egui;
 use tokio::{runtime::Runtime, sync::mpsc};
 
+use crate::{core::SystemStats, windows_utils::monitor::start_system_monitor};
+
 type CommandSender = mpsc::UnboundedSender<AppCommand>;
 type CommandReceiver = mpsc::UnboundedReceiver<AppCommand>;
 type EventSender = mpsc::UnboundedSender<AppEvent>;
@@ -30,8 +32,28 @@ pub enum AppEvent {
     StatusChanged(String),
     ProgressChanged(f32),
     TaskFinished(String),
+    ResourceUpdate(SystemStats),
     BackendStopped,
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppTab {
+    Dashboard,
+    IikoInstall,
+    FiscalDrivers,
+    Logs,
+}
+
+impl AppTab {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Dashboard => "Главная (Dashboard)",
+            Self::IikoInstall => "Установка iiko",
+            Self::FiscalDrivers => "ККТ и Драйверы",
+            Self::Logs => "Логи",
+        }
+    }
 }
 
 fn main() -> eframe::Result {
@@ -67,6 +89,7 @@ fn start_backend_thread(rx_cmd: CommandReceiver, tx_event: EventSender) -> JoinH
         .spawn(move || {
             let runtime = Runtime::new().expect("failed to start Tokio runtime");
             runtime.block_on(async move {
+                tokio::spawn(start_system_monitor(tx_event.clone()));
                 let _ = tx_event.send(AppEvent::BackendReady);
                 backend_loop(rx_cmd, tx_event).await;
             });
@@ -112,6 +135,8 @@ pub struct RustMhApp {
     status_text: String,
     progress: f32,
     backend_busy: bool,
+    current_stats: Option<SystemStats>,
+    current_tab: AppTab,
     log_lines: Vec<String>,
 }
 
@@ -131,6 +156,8 @@ impl RustMhApp {
             status_text: "UI готов. Ожидание backend...".to_owned(),
             progress: 0.0,
             backend_busy: false,
+            current_stats: None,
+            current_tab: AppTab::Dashboard,
             log_lines: Vec::new(),
         }
     }
@@ -160,6 +187,9 @@ impl RustMhApp {
                 self.status_text = message.clone();
                 self.log_lines.push(message);
             }
+            AppEvent::ResourceUpdate(stats) => {
+                self.current_stats = Some(stats);
+            }
             AppEvent::BackendStopped => {
                 self.status_text = "Backend остановлен".to_owned();
                 self.log_lines.push(self.status_text.clone());
@@ -183,24 +213,85 @@ impl RustMhApp {
             self.apply_event(AppEvent::Error(format!("backend channel closed: {error}")));
         }
     }
-}
 
-impl eframe::App for RustMhApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain_backend_events();
-        ctx.request_repaint();
+    fn show_status_panel(&self, ui: &mut egui::Ui) {
+        egui::Panel::top("status_panel").show_inside(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if let Some(stats) = &self.current_stats {
+                    let ram_ratio = ratio(stats.ram_used, stats.ram_total);
+
+                    ui.label(format!("🖥 CPU: {:.0}%", stats.cpu_usage));
+                    ui.add(
+                        egui::ProgressBar::new(stats.cpu_usage / 100.0)
+                            .desired_width(110.0)
+                            .show_percentage(),
+                    );
+                    ui.separator();
+                    ui.label(format!(
+                        "🧠 RAM: {:.1}/{:.1} GB",
+                        bytes_to_gb(stats.ram_used),
+                        bytes_to_gb(stats.ram_total)
+                    ));
+                    ui.add(
+                        egui::ProgressBar::new(ram_ratio)
+                            .desired_width(130.0)
+                            .show_percentage(),
+                    );
+                    ui.separator();
+                    ui.label(format!(
+                        "💾 Disk: R {} / W {} KB/s",
+                        stats.disk_read_kb, stats.disk_write_kb
+                    ));
+                } else {
+                    ui.label("🖥 CPU: -- | 🧠 RAM: --/-- GB | 💾 Disk: R -- / W -- KB/s");
+                    ui.add(egui::ProgressBar::new(0.0).desired_width(110.0));
+                    ui.add(egui::ProgressBar::new(0.0).desired_width(130.0));
+                }
+            });
+        });
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        ui.vertical_centered(|ui| {
-            ui.heading("TechToolKit");
-            ui.label("Windows-native toolkit для обслуживания iiko-касс");
-        });
+    fn show_navigation(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::left("navigation_panel")
+            .resizable(false)
+            .default_size(220.0)
+            .show_inside(ui, |ui| {
+                ui.heading("TechToolKit");
+                ui.separator();
+                ui.selectable_value(
+                    &mut self.current_tab,
+                    AppTab::Dashboard,
+                    AppTab::Dashboard.title(),
+                );
+                ui.selectable_value(
+                    &mut self.current_tab,
+                    AppTab::IikoInstall,
+                    AppTab::IikoInstall.title(),
+                );
+                ui.selectable_value(
+                    &mut self.current_tab,
+                    AppTab::FiscalDrivers,
+                    AppTab::FiscalDrivers.title(),
+                );
+                ui.selectable_value(&mut self.current_tab, AppTab::Logs, AppTab::Logs.title());
+            });
+    }
 
-        ui.add_space(24.0);
+    fn show_central_panel(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show_inside(ui, |ui| match self.current_tab {
+            AppTab::Dashboard => self.show_dashboard(ui),
+            AppTab::IikoInstall => self.show_placeholder(ui, AppTab::IikoInstall.title()),
+            AppTab::FiscalDrivers => self.show_placeholder(ui, AppTab::FiscalDrivers.title()),
+            AppTab::Logs => self.show_logs(ui),
+        });
+    }
+
+    fn show_dashboard(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Главная");
+        ui.add_space(12.0);
 
         ui.horizontal(|ui| {
-            let test_button = egui::Button::new("Тест Backend").min_size(egui::vec2(180.0, 56.0));
+            let test_button = egui::Button::new("Тест Backend").min_size(egui::vec2(180.0, 48.0));
 
             if ui.add_enabled(!self.backend_busy, test_button).clicked() {
                 self.backend_busy = true;
@@ -211,18 +302,24 @@ impl eframe::App for RustMhApp {
             ui.label(&self.status_text);
         });
 
-        ui.add_space(16.0);
+        ui.add_space(12.0);
         ui.add(
             egui::ProgressBar::new(self.progress)
                 .desired_width(f32::INFINITY)
                 .show_percentage()
                 .text(format!("{:.0}%", self.progress * 100.0)),
         );
+    }
 
-        ui.add_space(24.0);
-        ui.separator();
+    fn show_placeholder(&self, ui: &mut egui::Ui, title: &str) {
+        ui.heading(title);
         ui.add_space(12.0);
+        ui.label("Раздел в работе.");
+    }
 
+    fn show_logs(&self, ui: &mut egui::Ui) {
+        ui.heading("Логи");
+        ui.add_space(12.0);
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
             .auto_shrink([false, false])
@@ -231,6 +328,19 @@ impl eframe::App for RustMhApp {
                     ui.label(line);
                 }
             });
+    }
+}
+
+impl eframe::App for RustMhApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain_backend_events();
+        ctx.request_repaint();
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show_status_panel(ui);
+        self.show_navigation(ui);
+        self.show_central_panel(ui);
     }
 }
 
@@ -252,4 +362,16 @@ fn configure_touch_ui(ctx: &egui::Context) {
         style.spacing.button_padding = egui::vec2(18.0, 12.0);
         style.spacing.interact_size = egui::vec2(64.0, 48.0);
     });
+}
+
+fn ratio(value: u64, total: u64) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        (value as f32 / total as f32).clamp(0.0, 1.0)
+    }
+}
+
+fn bytes_to_gb(bytes: u64) -> f64 {
+    bytes as f64 / 1024.0 / 1024.0 / 1024.0
 }
