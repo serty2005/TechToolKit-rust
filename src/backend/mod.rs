@@ -11,13 +11,17 @@ use std::time::Duration;
 
 use crate::{
     CommandReceiver, EventSender,
-    core::{AppCommand, AppEvent, AppTask},
+    core::{
+        AppCommand, AppEvent, AppTask,
+        asset_mgr::{self, IikoDistribution},
+    },
 };
 
 pub async fn backend_loop(mut rx_cmd: CommandReceiver, tx_event: EventSender) {
     while let Some(command) = rx_cmd.recv().await {
         match command {
             AppCommand::TestBackend => run_backend_test(&tx_event).await,
+            AppCommand::RefreshIikoVersions => refresh_iiko_versions(tx_event.clone()),
             AppCommand::EnqueueTask(task) => enqueue_task(task, tx_event.clone()),
             AppCommand::Shutdown => {
                 let _ = tx_event.send(AppEvent::BackendStopped);
@@ -41,6 +45,45 @@ fn enqueue_task(task: AppTask, tx_event: EventSender) {
                 if let Err(error) = downloader::download_file(url, dest, tx_event.clone()).await {
                     let _ = tx_event.send(AppEvent::Error(format!("{task_name}: {error}")));
                 }
+            }
+            AppTask::DownloadIikoDistribution {
+                component,
+                version,
+                dest_dir,
+            } => {
+                let distribution = IikoDistribution::new(component, version);
+                if let Err(error) = asset_mgr::download_iiko_distribution(
+                    distribution,
+                    dest_dir.into(),
+                    tx_event.clone(),
+                )
+                .await
+                {
+                    let _ = tx_event.send(AppEvent::Error(format!("{task_name}: {error}")));
+                }
+            }
+        }
+    });
+}
+
+fn refresh_iiko_versions(tx_event: EventSender) {
+    tokio::spawn(async move {
+        let _ = tx_event.send(AppEvent::StatusChanged(
+            "Получение списка версий iiko с FTP...".to_owned(),
+        ));
+
+        match asset_mgr::fetch_iiko_versions().await {
+            Ok(versions) => {
+                let count = versions.len();
+                let _ = tx_event.send(AppEvent::IikoVersionsLoaded(versions));
+                let _ = tx_event.send(AppEvent::StatusChanged(format!(
+                    "Загружено версий iiko: {count}"
+                )));
+            }
+            Err(error) => {
+                let _ = tx_event.send(AppEvent::Error(format!(
+                    "Не удалось получить список версий iiko: {error}"
+                )));
             }
         }
     });

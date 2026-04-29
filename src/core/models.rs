@@ -1,8 +1,18 @@
 use std::path::Path;
 
+use crate::core::asset_mgr::IikoComponent;
+
 #[derive(Debug, Clone)]
 pub enum AppTask {
-    DownloadFile { url: String, dest: String },
+    DownloadFile {
+        url: String,
+        dest: String,
+    },
+    DownloadIikoDistribution {
+        component: IikoComponent,
+        version: String,
+        dest_dir: String,
+    },
 }
 
 impl AppTask {
@@ -13,6 +23,9 @@ impl AppTask {
                 .and_then(|name| name.to_str())
                 .map(|name| format!("Скачивание {name}"))
                 .unwrap_or_else(|| "Скачивание файла".to_owned()),
+            Self::DownloadIikoDistribution {
+                component, version, ..
+            } => format!("Скачивание {} {}", component.title(), version),
         }
     }
 }
@@ -20,6 +33,7 @@ impl AppTask {
 #[derive(Debug, Clone)]
 pub enum AppCommand {
     TestBackend,
+    RefreshIikoVersions,
     EnqueueTask(AppTask),
     Shutdown,
 }
@@ -34,6 +48,7 @@ pub enum AppEvent {
         progress: f32,
         status_text: String,
     },
+    IikoVersionsLoaded(Vec<String>),
     TaskFinished(String),
     ResourceUpdate(SystemStats),
     BackendStopped,

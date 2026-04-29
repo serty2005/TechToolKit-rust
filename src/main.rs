@@ -4,7 +4,11 @@ mod core;
 mod ui;
 mod windows_utils;
 
-use std::thread::{self, JoinHandle};
+use std::{
+    path::PathBuf,
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
 use clap::Parser;
 use eframe::egui;
@@ -13,7 +17,7 @@ use tokio::{runtime::Runtime, sync::mpsc};
 use crate::{
     backend::backend_loop,
     cli::{Cli, CliCommand},
-    core::{AppCommand, AppEvent, AppTask, SystemStats},
+    core::{AppCommand, AppEvent, AppTask, IikoComponent, SystemStats},
     windows_utils::monitor::start_system_monitor,
 };
 
@@ -111,6 +115,12 @@ pub struct RustMhApp {
     current_stats: Option<SystemStats>,
     current_tab: AppTab,
     log_lines: Vec<String>,
+    iiko_component: IikoComponent,
+    iiko_versions: Vec<String>,
+    iiko_selected_version: usize,
+    iiko_manual_version: String,
+    iiko_versions_loading: bool,
+    iiko_versions_status: String,
 }
 
 impl RustMhApp {
@@ -121,6 +131,7 @@ impl RustMhApp {
         backend_thread: JoinHandle<()>,
     ) -> Self {
         configure_touch_ui(&cc.egui_ctx);
+        let _ = tx_cmd.send(AppCommand::RefreshIikoVersions);
 
         Self {
             tx_cmd,
@@ -137,13 +148,22 @@ impl RustMhApp {
             current_stats: None,
             current_tab: AppTab::Dashboard,
             log_lines: Vec::new(),
+            iiko_component: IikoComponent::Front,
+            iiko_versions: Vec::new(),
+            iiko_selected_version: 0,
+            iiko_manual_version: String::new(),
+            iiko_versions_loading: true,
+            iiko_versions_status: "Загрузка списка версий iiko...".to_owned(),
         }
     }
 
-    fn drain_backend_events(&mut self) {
+    fn drain_backend_events(&mut self) -> bool {
+        let mut received_any = false;
         while let Ok(event) = self.rx_event.try_recv() {
+            received_any = true;
             self.apply_event(event);
         }
+        received_any
     }
 
     fn apply_event(&mut self, event: AppEvent) {
@@ -170,6 +190,18 @@ impl RustMhApp {
                 self.status_text = status_text;
                 self.task_active = self.task_progress < 1.0;
             }
+            AppEvent::IikoVersionsLoaded(versions) => {
+                self.iiko_versions = versions;
+                self.iiko_selected_version = 0;
+                self.iiko_versions_loading = false;
+                self.iiko_versions_status = if let Some(version) = self.iiko_versions.first() {
+                    self.iiko_manual_version = version.clone();
+                    format!("Доступно версий: {}", self.iiko_versions.len())
+                } else {
+                    "Список версий пуст. Можно ввести версию вручную.".to_owned()
+                };
+                self.log_lines.push(self.iiko_versions_status.clone());
+            }
             AppEvent::TaskFinished(message) => {
                 self.backend_busy = false;
                 self.progress = 1.0;
@@ -191,6 +223,7 @@ impl RustMhApp {
             AppEvent::Error(message) => {
                 self.backend_busy = false;
                 self.task_active = false;
+                self.iiko_versions_loading = false;
                 self.status_text = format!("Ошибка: {message}");
                 self.task_status_text = self.status_text.clone();
                 self.log_lines.push(self.status_text.clone());
@@ -311,22 +344,74 @@ impl RustMhApp {
         ui.heading("Установка iiko");
         ui.add_space(12.0);
 
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Компонент:");
+            for component in IikoComponent::ALL {
+                ui.radio_value(&mut self.iiko_component, component, component.title());
+            }
+        });
+
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            let download_button =
-                egui::Button::new("Тестовая загрузка").min_size(egui::vec2(190.0, 48.0));
+            ui.label("Версия:");
 
-            if ui.add_enabled(!self.task_active, download_button).clicked() {
-                let dest = std::env::temp_dir().join("rustmh-test-download-10mb.bin");
+            egui::ComboBox::from_id_salt("iiko_version_select")
+                .selected_text(self.selected_iiko_version_label())
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for (idx, version) in self.iiko_versions.iter().enumerate() {
+                        if ui
+                            .selectable_value(&mut self.iiko_selected_version, idx, version)
+                            .clicked()
+                        {
+                            self.iiko_manual_version = version.clone();
+                        }
+                    }
+                });
 
-                self.task_name = "Скачивание rustmh-test-download-10mb.bin".to_owned();
-                self.task_status_text = format!("Ожидание backend: {}", dest.display());
+            if self.iiko_versions_loading {
+                ui.spinner();
+            }
+
+            if ui
+                .add_enabled(!self.iiko_versions_loading, egui::Button::new("Обновить"))
+                .clicked()
+            {
+                self.iiko_versions_loading = true;
+                self.iiko_versions_status = "Загрузка списка версий iiko...".to_owned();
+                self.send_command(AppCommand::RefreshIikoVersions);
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Вручную:");
+            ui.text_edit_singleline(&mut self.iiko_manual_version);
+            ui.label(&self.iiko_versions_status);
+        });
+
+        ui.add_space(8.0);
+        let selected_version_ready = !self.selected_iiko_version().is_empty();
+
+        ui.horizontal(|ui| {
+            let download_button = egui::Button::new("Скачать").min_size(egui::vec2(150.0, 48.0));
+
+            if ui
+                .add_enabled(!self.task_active && selected_version_ready, download_button)
+                .clicked()
+            {
+                let version = self.selected_iiko_version();
+                let dest_dir = default_download_dir();
+
+                self.task_name = format!("Скачивание {} {version}", self.iiko_component.title());
+                self.task_status_text = format!("Ожидание backend: {}", dest_dir.display());
                 self.task_progress = 0.0;
                 self.displayed_task_progress = 0.0;
                 self.task_active = true;
 
-                self.send_command(AppCommand::EnqueueTask(AppTask::DownloadFile {
-                    url: "https://speed.hetzner.de/10MB.bin".to_owned(),
-                    dest: dest.to_string_lossy().into_owned(),
+                self.send_command(AppCommand::EnqueueTask(AppTask::DownloadIikoDistribution {
+                    component: self.iiko_component,
+                    version,
+                    dest_dir: dest_dir.to_string_lossy().into_owned(),
                 }));
             }
 
@@ -346,6 +431,25 @@ impl RustMhApp {
             ui.add_space(4.0);
             ui.label(&self.task_status_text);
         });
+    }
+
+    fn selected_iiko_version(&self) -> String {
+        let manual = self.iiko_manual_version.trim();
+        if !manual.is_empty() {
+            return manual.to_owned();
+        }
+
+        self.iiko_versions
+            .get(self.iiko_selected_version)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn selected_iiko_version_label(&self) -> String {
+        self.iiko_versions
+            .get(self.iiko_selected_version)
+            .cloned()
+            .unwrap_or_else(|| "Введите версию вручную".to_owned())
     }
 
     fn show_placeholder(&self, ui: &mut egui::Ui, title: &str) {
@@ -370,16 +474,23 @@ impl RustMhApp {
 
 impl eframe::App for RustMhApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain_backend_events();
+        let received_events = self.drain_backend_events();
 
         let delta = self.task_progress - self.displayed_task_progress;
+        let mut progress_changed = false;
         if delta.abs() > 0.001 {
             self.displayed_task_progress += delta * 0.18;
+            progress_changed = true;
         } else {
             self.displayed_task_progress = self.task_progress;
         }
 
-        ctx.request_repaint();
+        if received_events {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else {
+            let _animating_progress = progress_changed;
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -419,4 +530,11 @@ fn ratio(value: u64, total: u64) -> f32 {
 
 fn bytes_to_gb(bytes: u64) -> f64 {
     bytes as f64 / 1024.0 / 1024.0 / 1024.0
+}
+
+fn default_download_dir() -> PathBuf {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .map(|path| path.join("Downloads"))
+        .unwrap_or_else(std::env::temp_dir)
 }
