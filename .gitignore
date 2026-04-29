@@ -1,0 +1,25 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+
+# Windows & MSVC Build Artifacts
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.obj
+Thumbs.db
+
+# IDEs and Editors
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/
+*.iml
+
+# Logs and App Data
+*.log
+rustMH.log
+*.tmp
